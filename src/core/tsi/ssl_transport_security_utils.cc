@@ -24,6 +24,7 @@
 #include <openssl/ec.h>
 #include <openssl/err.h>
 #include <openssl/evp.h>
+#include <openssl/obj_mac.h>
 #include <openssl/pem.h>
 #include <openssl/rsa.h>
 #include <openssl/ssl.h>
@@ -449,4 +450,42 @@ absl::StatusOr<std::string> ParseUriString(GENERAL_NAME* subject_alt_name) {
   OPENSSL_free(name);
   return ret;
 }
+
+absl::StatusOr<int> ConvertKeyExchangeGroupToNidOrSslGroup(
+    grpc_tls_key_exchange_group group) {
+// In BoringSSL, we use the SSL_GROUP_* constants and the
+// SSL_CTX_set1_group_ids() function.
+// In OpenSSL, we use the NID_* constants and the SSL_CTX_set1_groups()
+// function.
+#if defined(OPENSSL_IS_BORINGSSL)
+  switch (group) {
+    case GRPC_TLS_GROUP_SECP256R1:
+      return SSL_GROUP_SECP256R1;
+    case GRPC_TLS_GROUP_X25519:
+      return SSL_GROUP_X25519;
+    case GRPC_TLS_GROUP_X25519_MLKEM768:
+      return SSL_GROUP_X25519_MLKEM768;
+    case GRPC_TLS_GROUP_UNSPECIFIED:
+      return absl::InvalidArgumentError("Unspecified key exchange group.");
+    default:
+      return absl::InvalidArgumentError("Unknown key exchange group.");
+  }
+#else
+  switch (group) {
+    case GRPC_TLS_GROUP_SECP256R1:
+      return NID_X9_62_prime256v1;
+    case GRPC_TLS_GROUP_X25519:
+      return NID_X25519;
+#if OPENSSL_VERSION_NUMBER >= 0x30500000L
+    case GRPC_TLS_GROUP_X25519_MLKEM768:
+      return NID_X25519_MLKEM768;
+#endif  // OPENSSL_VERSION_NUMBER >= 0x30500000L
+    case GRPC_TLS_GROUP_UNSPECIFIED:
+      return absl::InvalidArgumentError("Unspecified key exchange group.");
+    default:
+      return absl::InvalidArgumentError("Unknown key exchange group.");
+  }
+#endif
+}
+
 }  // namespace tsi

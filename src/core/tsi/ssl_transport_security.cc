@@ -1133,7 +1133,8 @@ static tsi_result ssl_ctx_load_verification_certs(SSL_CTX* context,
 // cipher list and the ephemeral ECDH key.
 static tsi_result populate_ssl_context(
     SSL_CTX* context, const tsi_ssl_pem_key_cert_pair* key_cert_pair,
-    const char* cipher_list) {
+    const char* cipher_list,
+    const std::vector<grpc_tls_key_exchange_group>& key_exchange_groups) {
   tsi_result result = TSI_OK;
   if (key_cert_pair != nullptr) {
     if (!key_cert_pair->cert_chain.empty()) {
@@ -1177,7 +1178,40 @@ static tsi_result populate_ssl_context(
     LOG(ERROR) << "Invalid cipher list: " << cipher_list;
     return TSI_INVALID_ARGUMENT;
   }
-  {
+  if (!key_exchange_groups.empty()) {
+    std::vector<int> group_ids;
+    group_ids.reserve(key_exchange_groups.size());
+    for (const auto& group : key_exchange_groups) {
+      auto nid = tsi::ConvertKeyExchangeGroupToNidOrSslGroup(group);
+      if (!nid.ok()) {
+        LOG(ERROR) << "Could not convert key exchange group to nid.";
+        return TSI_INVALID_ARGUMENT;
+      }
+      group_ids.push_back(*nid);
+    }
+#if OPENSSL_VERSION_NUMBER >= 0x10100000
+#if defined(OPENSSL_IS_BORINGSSL)
+    std::vector<uint16_t> boringssl_group_ids;
+    boringssl_group_ids.reserve(group_ids.size());
+    for (int id : group_ids) {
+      boringssl_group_ids.push_back(static_cast<uint16_t>(id));
+    }
+    if (!SSL_CTX_set1_group_ids(context, boringssl_group_ids.data(),
+                                boringssl_group_ids.size())) {
+#else
+    if (!SSL_CTX_set1_groups(context, group_ids.data(), group_ids.size())) {
+#endif  // defined(OPENSSL_IS_BORINGSSL)
+      LOG(ERROR) << "Could not set key exchange groups: "
+                 << absl::StrJoin(group_ids, ",");
+      return TSI_INTERNAL_ERROR;
+    }
+    SSL_CTX_set_options(context, SSL_OP_SINGLE_ECDH_USE);
+#else
+    LOG(ERROR) << "SSL_CTX_set1_groups is not supported in OpenSSL < 1.1.1 "
+                  "version.";
+    return TSI_FAILED_PRECONDITION;
+#endif  // OPENSSL_VERSION_NUMBER >= 0x10100000
+  } else {
 #if OPENSSL_VERSION_NUMBER < 0x30000000L
     EC_KEY* ecdh = EC_KEY_new_by_curve_name(NID_X9_62_prime256v1);
     if (!SSL_CTX_set_tmp_ecdh(context, ecdh)) {
@@ -2892,7 +2926,8 @@ tsi_result tsi_create_ssl_client_handshaker_factory_with_options(
 
   do {
     result = populate_ssl_context(ssl_context, options->pem_key_cert_pair,
-                                  options->cipher_suites);
+                                  options->cipher_suites,
+                                  options->key_exchange_groups);
     if (result != TSI_OK) break;
 
 #if defined(OPENSSL_IS_BORINGSSL)
@@ -3109,9 +3144,9 @@ tsi_result tsi_create_ssl_server_handshaker_factory_with_options(
                                                 options->max_tls_version);
       if (result != TSI_OK) return result;
 
-      result = populate_ssl_context(impl->ssl_contexts[i],
-                                    &options->pem_key_cert_pairs[i],
-                                    options->cipher_suites);
+      result = populate_ssl_context(
+          impl->ssl_contexts[i], &options->pem_key_cert_pairs[i],
+          options->cipher_suites, options->key_exchange_groups);
       if (result != TSI_OK) break;
 
 #if defined(OPENSSL_IS_BORINGSSL)
